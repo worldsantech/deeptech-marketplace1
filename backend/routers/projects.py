@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from backend.core.dependencies import get_current_user
@@ -30,6 +31,21 @@ ALLOWED_CURRENCIES = {
     "EUR",
     "USD",
     "PLN",
+}
+
+ALLOWED_SORT_FIELDS = {
+    "created_at",
+    "budget_min",
+    "budget_max",
+    "deadline_days",
+    "title",
+    "country",
+    "city",
+}
+
+ALLOWED_SORT_ORDERS = {
+    "asc",
+    "desc",
 }
 
 
@@ -112,6 +128,126 @@ def create_project(
     db.refresh(project)
 
     return project
+
+
+@router.get("/search")
+def search_projects(
+    q: str | None = Query(None),
+    country: str | None = Query(None),
+    city: str | None = Query(None),
+    project_type: str | None = Query(None),
+    currency: str | None = Query(None),
+    status: str | None = Query("open"),
+    budget_min: int | None = Query(None, ge=0),
+    budget_max: int | None = Query(None, ge=0),
+    deadline_days_max: int | None = Query(None, ge=1),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Project)
+
+    if q:
+        q_clean = q.strip()
+        if q_clean:
+            pattern = f"%{q_clean}%"
+            query = query.filter(
+                or_(
+                    Project.title.ilike(pattern),
+                    Project.description.ilike(pattern),
+                    Project.country.ilike(pattern),
+                    Project.city.ilike(pattern),
+                    Project.project_type.ilike(pattern),
+                )
+            )
+
+    if country:
+        query = query.filter(Project.country.ilike(country.strip()))
+
+    if city:
+        query = query.filter(Project.city.ilike(city.strip()))
+
+    if project_type:
+        clean_project_type = project_type.strip().lower()
+        if clean_project_type not in ALLOWED_PROJECT_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid project type. Allowed: {sorted(ALLOWED_PROJECT_TYPES)}",
+            )
+        query = query.filter(Project.project_type == clean_project_type)
+
+    if currency:
+        clean_currency = currency.strip().upper()
+        if clean_currency not in ALLOWED_CURRENCIES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid currency. Allowed: {sorted(ALLOWED_CURRENCIES)}",
+            )
+        query = query.filter(Project.currency == clean_currency)
+
+    if status:
+        clean_status = status.strip().lower()
+        if clean_status not in ALLOWED_PROJECT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status. Allowed: {sorted(ALLOWED_PROJECT_STATUSES)}",
+            )
+        query = query.filter(Project.status == clean_status)
+
+    if budget_min is not None:
+        query = query.filter(Project.budget_max >= budget_min)
+
+    if budget_max is not None:
+        query = query.filter(Project.budget_min <= budget_max)
+
+    if deadline_days_max is not None:
+        query = query.filter(Project.deadline_days <= deadline_days_max)
+
+    if sort_by not in ALLOWED_SORT_FIELDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid sort_by. Allowed: {sorted(ALLOWED_SORT_FIELDS)}",
+        )
+
+    if sort_order not in ALLOWED_SORT_ORDERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid sort_order. Allowed: {sorted(ALLOWED_SORT_ORDERS)}",
+        )
+
+    sort_column = getattr(Project, sort_by)
+    if sort_order == "asc":
+        query = query.order_by(sort_column.asc(), Project.id.desc())
+    else:
+        query = query.order_by(sort_column.desc(), Project.id.desc())
+
+    total = query.count()
+
+    offset = (page - 1) * page_size
+    items = query.offset(offset).limit(page_size).all()
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+        "filters": {
+            "q": q,
+            "country": country,
+            "city": city,
+            "project_type": project_type,
+            "currency": currency,
+            "status": status,
+            "budget_min": budget_min,
+            "budget_max": budget_max,
+            "deadline_days_max": deadline_days_max,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        },
+        "items": items,
+    }
 
 
 @router.get("/my", response_model=list[ProjectResponse])
