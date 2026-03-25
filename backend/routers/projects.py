@@ -1,24 +1,31 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from backend.core.dependencies import get_current_user
+from backend.core.roles import ROLE_CUSTOMER
 from backend.database.session import get_db
 from backend.models.project import Project
 from backend.models.user import User
-from backend.routers.auth import get_current_user
 from backend.services.project_event_logger import log_project_event
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
-
-ALLOWED_PROJECT_TYPES = [
+ALLOWED_PROJECT_TYPES = {
     "automation",
     "mechanical",
     "electrical",
     "plc",
     "maintenance",
-]
+}
+
+ALLOWED_PROJECT_STATUSES = {
+    "open",
+    "in_progress",
+    "completed",
+    "cancelled",
+}
 
 
 @router.post("")
@@ -32,20 +39,46 @@ def create_project(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "Customer":
-        raise HTTPException(status_code=403, detail="Only customers can create projects")
+    if current_user.role != ROLE_CUSTOMER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only customers can create projects",
+        )
 
-    if project_type not in ALLOWED_PROJECT_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid project type")
+    clean_title = title.strip()
+    clean_description = description.strip()
+    clean_country = country.strip()
+    clean_project_type = project_type.strip().lower()
+
+    if not clean_title:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Title cannot be empty",
+        )
+
+    if not clean_description:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Description cannot be empty",
+        )
+
+    if clean_project_type not in ALLOWED_PROJECT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid project type. Allowed: {sorted(ALLOWED_PROJECT_TYPES)}",
+        )
 
     if budget_min > budget_max:
-        raise HTTPException(status_code=400, detail="budget_min cannot be greater than budget_max")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="budget_min cannot be greater than budget_max",
+        )
 
     project = Project(
-        title=title,
-        description=description,
-        country=country,
-        project_type=project_type,
+        title=clean_title,
+        description=clean_description,
+        country=clean_country,
+        project_type=clean_project_type,
         budget_min=budget_min,
         budget_max=budget_max,
         owner_id=current_user.id,
@@ -84,7 +117,12 @@ def get_my_projects(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return db.query(Project).filter(Project.owner_id == current_user.id).all()
+    return (
+        db.query(Project)
+        .filter(Project.owner_id == current_user.id)
+        .order_by(Project.id.desc())
+        .all()
+    )
 
 
 @router.get("/{project_id}")
@@ -95,7 +133,10 @@ def get_project(
     project = db.query(Project).filter(Project.id == project_id).first()
 
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
 
     return project
 
@@ -116,20 +157,44 @@ def update_project(
     project = db.query(Project).filter(Project.id == project_id).first()
 
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
 
     if project.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not allowed to edit this project")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not allowed to edit this project",
+        )
 
-    if project_type is not None and project_type not in ALLOWED_PROJECT_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid project type")
+    clean_project_type = None
+    if project_type is not None:
+        clean_project_type = project_type.strip().lower()
+        if clean_project_type not in ALLOWED_PROJECT_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid project type. Allowed: {sorted(ALLOWED_PROJECT_TYPES)}",
+            )
+
+    clean_status = None
+    if status is not None:
+        clean_status = status.strip().lower()
+        if clean_status not in ALLOWED_PROJECT_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status. Allowed: {sorted(ALLOWED_PROJECT_STATUSES)}",
+            )
 
     new_budget_min = budget_min if budget_min is not None else project.budget_min
     new_budget_max = budget_max if budget_max is not None else project.budget_max
 
     if new_budget_min is not None and new_budget_max is not None:
         if new_budget_min > new_budget_max:
-            raise HTTPException(status_code=400, detail="budget_min cannot be greater than budget_max")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="budget_min cannot be greater than budget_max",
+            )
 
     original_title = project.title
     original_description = project.description
@@ -141,20 +206,26 @@ def update_project(
 
     changed_fields = []
 
-    if title is not None and title != project.title:
-        project.title = title
-        changed_fields.append("title")
+    if title is not None:
+        clean_title = title.strip()
+        if clean_title != project.title:
+            project.title = clean_title
+            changed_fields.append("title")
 
-    if description is not None and description != project.description:
-        project.description = description
-        changed_fields.append("description")
+    if description is not None:
+        clean_description = description.strip()
+        if clean_description != project.description:
+            project.description = clean_description
+            changed_fields.append("description")
 
-    if country is not None and country != project.country:
-        project.country = country
-        changed_fields.append("country")
+    if country is not None:
+        clean_country = country.strip()
+        if clean_country != project.country:
+            project.country = clean_country
+            changed_fields.append("country")
 
-    if project_type is not None and project_type != project.project_type:
-        project.project_type = project_type
+    if clean_project_type is not None and clean_project_type != project.project_type:
+        project.project_type = clean_project_type
         changed_fields.append("project_type")
 
     if budget_min is not None and budget_min != project.budget_min:
@@ -166,8 +237,8 @@ def update_project(
         changed_fields.append("budget_max")
 
     status_changed = False
-    if status is not None and status != project.status:
-        project.status = status
+    if clean_status is not None and clean_status != project.status:
+        project.status = clean_status
         changed_fields.append("status")
         status_changed = True
 
