@@ -1,16 +1,18 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
-
-from backend.schemas.profile import ProviderProfileResponse
 
 
 class ApplicationCreate(BaseModel):
     project_id: int
-    cover_letter: Optional[str] = None
-    proposed_budget: Optional[int] = None
-    estimated_timeline_days: Optional[int] = None
+    cover_letter: str
+    proposed_budget: int
+    estimated_timeline_days: int
+
+
+class ApplicationStatusUpdate(BaseModel):
+    status: str
 
 
 class ApplicationResponse(BaseModel):
@@ -18,21 +20,37 @@ class ApplicationResponse(BaseModel):
     project_id: int
     applicant_user_id: int
     application_type: str
-    cover_letter: Optional[str] = None
-    proposed_budget: Optional[int] = None
-    estimated_timeline_days: Optional[int] = None
+    cover_letter: str
+    proposed_budget: int
+    estimated_timeline_days: int
     status: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
 
 
-class ApplicationStatusUpdate(BaseModel):
+class ProjectSelectionResponse(BaseModel):
+    id: int
+    owner_id: int
+    title: str
+    description: str
+    country: Optional[str] = None
+    city: Optional[str] = None
+    project_type: Optional[str] = None
+    budget_min: Optional[int] = None
+    budget_max: Optional[int] = None
+    currency: Optional[str] = None
+    deadline_days: Optional[int] = None
     status: str
+    selected_application_id: Optional[int] = None
+    selected_applicant_user_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
 
 
-# 🔥 НОВИЙ СХЕМА ДЛЯ DETAILED VIEW
-class ApplicationWithProviderProfile(BaseModel):
+class ApplicationStatusUpdateResponse(BaseModel):
     application: ApplicationResponse
-    provider_profile: Optional[ProviderProfileResponse] = None
+    project: ProjectSelectionResponse
+    auto_rejected_applications: List[ApplicationResponse]

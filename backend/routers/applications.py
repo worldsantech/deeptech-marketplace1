@@ -15,6 +15,7 @@ from backend.schemas.application import (
     ApplicationCreate,
     ApplicationResponse,
     ApplicationStatusUpdate,
+    ApplicationStatusUpdateResponse,
 )
 from backend.services.project_event_logger import log_project_event
 
@@ -117,7 +118,10 @@ def create_application(
     return application
 
 
-@router.put("/{application_id}/status", response_model=ApplicationResponse)
+@router.put(
+    "/{application_id}/status",
+    response_model=ApplicationStatusUpdateResponse,
+)
 def update_application_status(
     application_id: int,
     payload: ApplicationStatusUpdate,
@@ -165,7 +169,11 @@ def update_application_status(
     previous_status = application.status
 
     if previous_status == payload.status:
-        return application
+        return {
+            "application": application,
+            "project": project,
+            "auto_rejected_applications": [],
+        }
 
     allowed_next_statuses = VALID_STATUS_TRANSITIONS.get(previous_status, set())
     if payload.status not in allowed_next_statuses:
@@ -224,6 +232,8 @@ def update_application_status(
     )
     db.add(provider_notification)
 
+    auto_rejected_applications = []
+
     if payload.status == "accepted":
         other_applications = (
             db.query(Application)
@@ -238,6 +248,7 @@ def update_application_status(
         for other_application in other_applications:
             old_other_status = other_application.status
             other_application.status = "rejected"
+            auto_rejected_applications.append(other_application)
 
             log_project_event(
                 db=db,
@@ -285,8 +296,18 @@ def update_application_status(
 
     db.commit()
     db.refresh(application)
+    db.refresh(project)
 
-    return application
+    refreshed_auto_rejected = []
+    for rejected_application in auto_rejected_applications:
+        db.refresh(rejected_application)
+        refreshed_auto_rejected.append(rejected_application)
+
+    return {
+        "application": application,
+        "project": project,
+        "auto_rejected_applications": refreshed_auto_rejected,
+    }
 
 
 @router.get("/my")
@@ -327,9 +348,12 @@ def get_my_applications(
                     "id": project.id,
                     "title": project.title,
                     "country": project.country,
+                    "city": getattr(project, "city", None),
                     "project_type": project.project_type,
                     "budget_min": project.budget_min,
                     "budget_max": project.budget_max,
+                    "currency": getattr(project, "currency", None),
+                    "deadline_days": getattr(project, "deadline_days", None),
                     "status": project.status,
                     "owner_id": project.owner_id,
                 },
