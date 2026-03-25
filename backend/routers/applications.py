@@ -21,6 +21,14 @@ from backend.services.project_event_logger import log_project_event
 router = APIRouter(prefix="/applications", tags=["applications"])
 
 ALLOWED_APPLICATION_STATUSES = {"shortlisted", "accepted", "rejected"}
+ACTIVE_APPLICATION_STATUSES = {"submitted", "shortlisted"}
+
+VALID_STATUS_TRANSITIONS = {
+    "submitted": {"shortlisted", "accepted", "rejected"},
+    "shortlisted": {"accepted", "rejected"},
+    "accepted": set(),
+    "rejected": set(),
+}
 
 
 @router.post("", response_model=ApplicationResponse, status_code=status.HTTP_201_CREATED)
@@ -29,20 +37,23 @@ def create_application(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if current_user.role != ROLE_PROVIDER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Provider can apply",
+        )
+
     project = db.query(Project).filter(Project.id == payload.project_id).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
 
     if project.status != "open":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="You can apply only to open projects",
-        )
-
-    if current_user.role != ROLE_PROVIDER:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Provider can apply",
         )
 
     existing_application = (
@@ -145,6 +156,24 @@ def update_application_status(
             detail="Invalid application status",
         )
 
+    if project.status in {"completed", "cancelled"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot update applications for completed or cancelled projects",
+        )
+
+    previous_status = application.status
+
+    if previous_status == payload.status:
+        return application
+
+    allowed_next_statuses = VALID_STATUS_TRANSITIONS.get(previous_status, set())
+    if payload.status not in allowed_next_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot change application status from '{previous_status}' to '{payload.status}'",
+        )
+
     if payload.status == "accepted":
         if (
             project.selected_application_id is not None
@@ -155,9 +184,13 @@ def update_application_status(
                 detail="Project already has an accepted application",
             )
 
-    previous_status = application.status
-    project_status_before = project.status
+        if project.status not in {"open"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only open projects can accept applications",
+            )
 
+    project_status_before = project.status
     application.status = payload.status
 
     if payload.status == "accepted":
@@ -165,24 +198,74 @@ def update_application_status(
         project.selected_application_id = application.id
         project.status = "in_progress"
 
-    if payload.status != previous_status:
-        log_project_event(
-            db=db,
-            project_id=project.id,
-            event_type=f"application_{payload.status}",
-            title=f"Application {payload.status}",
-            description=f"Application status changed from '{previous_status}' to '{payload.status}'",
-            actor_user_id=current_user.id,
-            entity_type="application",
-            entity_id=application.id,
-            metadata={
-                "old_status": previous_status,
-                "new_status": payload.status,
-                "applicant_user_id": application.applicant_user_id,
-            },
-        )
+    log_project_event(
+        db=db,
+        project_id=project.id,
+        event_type=f"application_{payload.status}",
+        title=f"Application {payload.status}",
+        description=f"Application status changed from '{previous_status}' to '{payload.status}'",
+        actor_user_id=current_user.id,
+        entity_type="application",
+        entity_id=application.id,
+        metadata={
+            "old_status": previous_status,
+            "new_status": payload.status,
+            "applicant_user_id": application.applicant_user_id,
+        },
+    )
+
+    provider_notification = Notification(
+        user_id=application.applicant_user_id,
+        type="application_status_updated",
+        title="Application status updated",
+        message=f"Your application for project '{project.title}' was marked as '{payload.status}'",
+        related_project_id=project.id,
+        related_application_id=application.id,
+    )
+    db.add(provider_notification)
 
     if payload.status == "accepted":
+        other_applications = (
+            db.query(Application)
+            .filter(
+                Application.project_id == project.id,
+                Application.id != application.id,
+                Application.status.in_(ACTIVE_APPLICATION_STATUSES),
+            )
+            .all()
+        )
+
+        for other_application in other_applications:
+            old_other_status = other_application.status
+            other_application.status = "rejected"
+
+            log_project_event(
+                db=db,
+                project_id=project.id,
+                event_type="application_rejected",
+                title="Application rejected",
+                description="Application was automatically rejected because another provider was selected",
+                actor_user_id=current_user.id,
+                entity_type="application",
+                entity_id=other_application.id,
+                metadata={
+                    "old_status": old_other_status,
+                    "new_status": "rejected",
+                    "applicant_user_id": other_application.applicant_user_id,
+                    "reason": "another_provider_selected",
+                },
+            )
+
+            other_provider_notification = Notification(
+                user_id=other_application.applicant_user_id,
+                type="application_status_updated",
+                title="Application status updated",
+                message=f"Your application for project '{project.title}' was marked as 'rejected'",
+                related_project_id=project.id,
+                related_application_id=other_application.id,
+            )
+            db.add(other_provider_notification)
+
         log_project_event(
             db=db,
             project_id=project.id,
@@ -200,16 +283,6 @@ def update_application_status(
             },
         )
 
-    provider_notification = Notification(
-        user_id=application.applicant_user_id,
-        type="application_status_updated",
-        title="Application status updated",
-        message=f"Your application for project '{project.title}' was marked as '{payload.status}'",
-        related_project_id=project.id,
-        related_application_id=application.id,
-    )
-
-    db.add(provider_notification)
     db.commit()
     db.refresh(application)
 
