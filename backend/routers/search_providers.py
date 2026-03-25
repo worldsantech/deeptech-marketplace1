@@ -1,7 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from backend.database.session import get_db
@@ -11,12 +11,17 @@ from backend.models.user import User
 
 router = APIRouter(prefix="/search/providers", tags=["Search"])
 
-
-ALLOWED_PROVIDER_SORTS = ["newest", "rating"]
+ALLOWED_PROVIDER_SORTS = {
+    "newest",
+    "rating",
+    "reviews_count",
+    "full_name",
+}
 
 
 @router.get("/")
 def search_providers(
+    q: Optional[str] = Query(None),
     skills: Optional[str] = Query(None),
     country: Optional[str] = Query(None),
     availability: Optional[str] = Query(None),
@@ -28,10 +33,10 @@ def search_providers(
     if sort_by not in ALLOWED_PROVIDER_SORTS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid sort_by. Allowed values: {', '.join(ALLOWED_PROVIDER_SORTS)}"
+            detail=f"Invalid sort_by. Allowed values: {', '.join(sorted(ALLOWED_PROVIDER_SORTS))}",
         )
 
-    base_query = (
+    query = (
         db.query(
             User,
             ProviderProfile,
@@ -44,27 +49,49 @@ def search_providers(
         .group_by(User.id, ProviderProfile.id)
     )
 
+    if q:
+        q_clean = q.strip()
+        if q_clean:
+            pattern = f"%{q_clean}%"
+            query = query.filter(
+                or_(
+                    User.full_name.ilike(pattern),
+                    ProviderProfile.bio.ilike(pattern),
+                    ProviderProfile.skills.ilike(pattern),
+                    ProviderProfile.country.ilike(pattern),
+                    ProviderProfile.availability.ilike(pattern),
+                )
+            )
+
     if country:
-        base_query = base_query.filter(ProviderProfile.country == country)
+        query = query.filter(ProviderProfile.country.ilike(country.strip()))
 
     if availability:
-        base_query = base_query.filter(ProviderProfile.availability == availability)
+        query = query.filter(ProviderProfile.availability.ilike(availability.strip()))
 
     if skills:
-        base_query = base_query.filter(ProviderProfile.skills.ilike(f"%{skills}%"))
+        query = query.filter(ProviderProfile.skills.ilike(f"%{skills.strip()}%"))
 
-    total = base_query.count()
+    total = query.count()
 
     if sort_by == "newest":
-        base_query = base_query.order_by(User.id.desc())
+        query = query.order_by(User.id.desc())
     elif sort_by == "rating":
-        base_query = base_query.order_by(
+        query = query.order_by(
             func.avg(Review.rating).desc().nullslast(),
             func.count(Review.id).desc(),
             User.id.desc(),
         )
+    elif sort_by == "reviews_count":
+        query = query.order_by(
+            func.count(Review.id).desc(),
+            func.avg(Review.rating).desc().nullslast(),
+            User.id.desc(),
+        )
+    elif sort_by == "full_name":
+        query = query.order_by(User.full_name.asc(), User.id.desc())
 
-    rows = base_query.offset(offset).limit(limit).all()
+    rows = query.offset(offset).limit(limit).all()
 
     items = []
     for user, profile, average_rating, reviews_count in rows:
@@ -88,10 +115,21 @@ def search_providers(
             }
         )
 
+    page = (offset // limit) + 1 if limit else 1
+    pages = (total + limit - 1) // limit if limit else 1
+
     return {
         "total": total,
         "limit": limit,
         "offset": offset,
-        "sort_by": sort_by,
+        "page": page,
+        "pages": pages,
+        "filters": {
+            "q": q,
+            "skills": skills,
+            "country": country,
+            "availability": availability,
+            "sort_by": sort_by,
+        },
         "items": items,
     }
