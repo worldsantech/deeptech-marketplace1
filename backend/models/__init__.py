@@ -1,9 +1,2 @@
-from backend.models.user import User
-from backend.models.project import Project
-from backend.models.application import Application
-from backend.models.message import Message
-from backend.models.customer_profile import CustomerProfile
-from backend.models.provider_profile import ProviderProfile
-from backend.models.saved_project import SavedProject
-from backend.models.notification import Notification
-from backend.models.review import Review
+# Do not import model classes here.
+# Importing models in this package initializer creates circular imports.

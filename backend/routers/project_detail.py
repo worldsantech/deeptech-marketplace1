@@ -14,20 +14,44 @@ from backend.models.user import User
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
 
-@router.get("/{project_id}/detail")
-def get_project_detail(
-    project_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def get_project_or_404(project_id: int, db: Session) -> Project:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found",
         )
+    return project
+
+
+def ensure_project_detail_access(project: Project, current_user: User) -> None:
+    is_owner = current_user.id == project.owner_id
+    is_selected_provider = (
+        project.selected_applicant_user_id is not None
+        and current_user.id == project.selected_applicant_user_id
+    )
+
+    if project.status == "open":
+        return
+
+    if not (is_owner or is_selected_provider):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this project detail",
+        )
+
+
+@router.get("/{project_id}/detail")
+def get_project_detail(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = get_project_or_404(project_id, db)
+    ensure_project_detail_access(project, current_user)
 
     is_owner = current_user.role == "Customer" and project.owner_id == current_user.id
+    is_selected_provider = current_user.id == project.selected_applicant_user_id
 
     is_saved = False
     has_applied = False
@@ -58,14 +82,16 @@ def get_project_detail(
 
         can_apply = project.status == "open" and not has_applied
 
-    applications_count = (
-        db.query(Application)
-        .filter(Application.project_id == project.id)
-        .count()
-    )
+    applications_count = 0
+    if is_owner:
+        applications_count = (
+            db.query(Application)
+            .filter(Application.project_id == project.id)
+            .count()
+        )
 
     selected_provider = None
-    if project.selected_applicant_user_id:
+    if project.selected_applicant_user_id and (is_owner or is_selected_provider):
         selected_user = (
             db.query(User)
             .filter(User.id == project.selected_applicant_user_id)
@@ -112,7 +138,7 @@ def get_project_detail(
             selected_provider = {
                 "user": {
                     "id": selected_user.id,
-                    "email": selected_user.email,
+                    "email": selected_user.email if is_owner or is_selected_provider else None,
                     "full_name": selected_user.full_name,
                     "role": selected_user.role,
                 },
@@ -141,20 +167,21 @@ def get_project_detail(
             "budget_max": project.budget_max,
             "status": project.status,
             "owner_id": project.owner_id,
-            "selected_application_id": project.selected_application_id,
-            "selected_applicant_user_id": project.selected_applicant_user_id,
+            "selected_application_id": project.selected_application_id if is_owner else None,
+            "selected_applicant_user_id": project.selected_applicant_user_id if (is_owner or is_selected_provider) else None,
         },
         "viewer": {
             "id": current_user.id,
             "role": current_user.role,
             "is_owner": is_owner,
+            "is_selected_provider": is_selected_provider,
             "is_saved": is_saved,
             "has_applied": has_applied,
             "my_application_status": my_application_status,
             "can_apply": can_apply,
         },
         "stats": {
-            "applications_count": applications_count,
+            "applications_count": applications_count if is_owner else None,
         },
         "selected_provider": selected_provider,
     }

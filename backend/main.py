@@ -1,25 +1,9 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from backend.database.base import Base
-from backend.database.database import engine
-
-from backend.models.application import Application
-from backend.models.attachment import Attachment
-from backend.models.conversation import Conversation
-from backend.models.customer_profile import CustomerProfile
-from backend.models.engineer_profile import EngineerProfile
-from backend.models.factory_profile import FactoryProfile
-from backend.models.message import Message
-from backend.models.milestone import Milestone
-from backend.models.notification import Notification
-from backend.models.organization import Organization
-from backend.models.project import Project
-from backend.models.project_completion_request import ProjectCompletionRequest
-from backend.models.project_event import ProjectEvent
-from backend.models.provider_profile import ProviderProfile
-from backend.models.review import Review
-from backend.models.user import User
-
+from backend.core.config import get_settings
+from backend.core.exceptions import register_exception_handlers
+from backend.core.logging import RequestLoggingMiddleware, configure_logging, logger
 from backend.routers.applications import router as applications_router
 from backend.routers.attachments import router as attachments_router
 from backend.routers.auth import router as auth_router
@@ -42,33 +26,83 @@ from backend.routers.reviews import router as reviews_router
 from backend.routers.search_projects import router as search_projects_router
 from backend.routers.search_providers import router as search_providers_router
 
-app = FastAPI()
+configure_logging()
+settings = get_settings()
 
-Base.metadata.create_all(bind=engine)
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=(
+        "B2B marketplace backend for customers and providers. "
+        "Core domains: auth, profiles, projects, applications, messaging, "
+        "notifications, reviews, dashboards, milestones, completion flow, and search."
+    ),
+    debug=settings.DEBUG,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ALLOW_ORIGINS if settings.CORS_ALLOW_ORIGINS else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(RequestLoggingMiddleware)
+
+register_exception_handlers(app)
 
 app.include_router(auth_router)
+
+app.include_router(profiles_router)
+app.include_router(engineers_router)
+app.include_router(profile_stats_router)
+
 app.include_router(projects_router)
 app.include_router(project_detail_router)
 app.include_router(applications_router)
-app.include_router(profiles_router)
-app.include_router(engineers_router)
-app.include_router(search_projects_router)
-app.include_router(search_providers_router)
-app.include_router(messages_router)
-app.include_router(homepage_router)
-app.include_router(favorites_router)
-app.include_router(provider_dashboard_router)
-app.include_router(customer_dashboard_router)
-app.include_router(notifications_router)
-app.include_router(project_completion_router)
-app.include_router(reviews_router)
-app.include_router(attachments_router)
-app.include_router(profile_stats_router)
 app.include_router(milestones_router)
 app.include_router(project_progress_router)
 app.include_router(project_activity_router)
+app.include_router(project_completion_router)
+app.include_router(reviews_router)
+
+app.include_router(messages_router)
+app.include_router(notifications_router)
+app.include_router(attachments_router)
+
+app.include_router(search_projects_router)
+app.include_router(search_providers_router)
+app.include_router(homepage_router)
+app.include_router(favorites_router)
+
+app.include_router(provider_dashboard_router)
+app.include_router(customer_dashboard_router)
 
 
-@app.get("/")
+@app.on_event("startup")
+def on_startup():
+    logger.info(
+        "app_startup app_name=%s version=%s env=%s debug=%s",
+        settings.APP_NAME,
+        settings.APP_VERSION,
+        settings.ENV,
+        settings.DEBUG,
+    )
+
+
+@app.get("/", tags=["Health"])
 def root():
-    return {"message": "Backend is running"}
+    return {
+        "message": "DeepTech Marketplace API is running",
+        "status": "ok",
+        "environment": settings.ENV,
+    }
+
+
+@app.get("/health", tags=["Health"])
+def health():
+    return {
+        "status": "ok",
+        "environment": settings.ENV,
+    }

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -31,6 +31,14 @@ def get_notification_or_404(notification_id: int, db: Session) -> Notification:
     return notification
 
 
+def ensure_notification_owner(notification: Notification, current_user: User) -> None:
+    if notification.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this notification",
+        )
+
+
 @router.get("", response_model=NotificationListResponse)
 def list_notifications(
     is_read: Optional[bool] = Query(default=None),
@@ -38,28 +46,26 @@ def list_notifications(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = db.query(Notification).filter(Notification.user_id == current_user.id)
+    base_query = db.query(Notification).filter(Notification.user_id == current_user.id)
 
+    items_query = base_query
     if is_read is not None:
-        query = query.filter(Notification.is_read == is_read)
+        items_query = items_query.filter(Notification.is_read == is_read)
 
     items = (
-        query.order_by(Notification.created_at.desc(), Notification.id.desc())
+        items_query
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
         .limit(limit)
         .all()
     )
 
-    total = (
-        db.query(Notification)
-        .filter(Notification.user_id == current_user.id)
-        .count()
-    )
+    total = base_query.count()
 
     unread_count = (
         db.query(Notification)
         .filter(
             Notification.user_id == current_user.id,
-            Notification.is_read == False,
+            Notification.is_read.is_(False),
         )
         .count()
     )
@@ -80,7 +86,7 @@ def get_unread_notifications_count(
         db.query(Notification)
         .filter(
             Notification.user_id == current_user.id,
-            Notification.is_read == False,
+            Notification.is_read.is_(False),
         )
         .count()
     )
@@ -95,20 +101,15 @@ def mark_notification_as_read(
     current_user: User = Depends(get_current_user),
 ):
     notification = get_notification_or_404(notification_id, db)
-
-    if notification.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have access to this notification",
-        )
+    ensure_notification_owner(notification, current_user)
 
     if not notification.is_read:
         notification.is_read = True
-        notification.read_at = datetime.utcnow()
+        notification.read_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(notification)
 
-    return notification
+    return NotificationResponse.model_validate(notification)
 
 
 @router.post("/read-all", response_model=NotificationUnreadCountResponse)
@@ -120,17 +121,27 @@ def mark_all_notifications_as_read(
         db.query(Notification)
         .filter(
             Notification.user_id == current_user.id,
-            Notification.is_read == False,
+            Notification.is_read.is_(False),
         )
         .all()
     )
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     for notification in unread_notifications:
         notification.is_read = True
         notification.read_at = now
 
-    db.commit()
+    if unread_notifications:
+        db.commit()
 
-    return NotificationUnreadCountResponse(unread_count=0)
+    remaining_unread_count = (
+        db.query(Notification)
+        .filter(
+            Notification.user_id == current_user.id,
+            Notification.is_read.is_(False),
+        )
+        .count()
+    )
+
+    return NotificationUnreadCountResponse(unread_count=remaining_unread_count)

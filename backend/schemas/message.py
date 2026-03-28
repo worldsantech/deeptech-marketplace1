@@ -7,9 +7,9 @@ from backend.schemas.attachment import AttachmentResponse
 
 
 class MessageCreate(BaseModel):
-    project_id: int
+    project_id: int = Field(..., ge=1)
     body: Optional[str] = Field(default=None, max_length=5000)
-    recipient_user_id: Optional[int] = None
+    recipient_user_id: Optional[int] = Field(default=None, ge=1)
     attachment_ids: List[int] = Field(default_factory=list)
 
 

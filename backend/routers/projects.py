@@ -2,8 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from backend.core.dependencies import get_current_user
-from backend.core.roles import ROLE_CUSTOMER
+from backend.core.dependencies import get_current_customer, get_current_user_optional
 from backend.database.session import get_db
 from backend.models.project import Project
 from backend.models.user import User
@@ -48,43 +47,142 @@ ALLOWED_SORT_ORDERS = {
     "desc",
 }
 
+VALID_PROJECT_STATUS_TRANSITIONS = {
+    "open": {"in_progress", "cancelled"},
+    "in_progress": {"completed", "cancelled"},
+    "completed": set(),
+    "cancelled": set(),
+}
 
-@router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-def create_project(
-    payload: ProjectCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if current_user.role != ROLE_CUSTOMER:
+
+def get_project_or_404(db: Session, project_id: int) -> Project:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+    return project
+
+
+def ensure_project_owner(project: Project, current_user: User) -> None:
+    if project.owner_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only customers can create projects",
+            detail="Not allowed to access this project",
         )
 
-    clean_title = payload.title.strip()
-    clean_description = payload.description.strip()
-    clean_country = payload.country.strip()
-    clean_city = payload.city.strip() if payload.city else None
-    clean_project_type = payload.project_type.strip().lower()
-    clean_currency = payload.currency.strip().upper() if payload.currency else "EUR"
 
+def ensure_project_participant(project: Project, current_user: User) -> None:
+    is_owner = current_user.id == project.owner_id
+    is_selected_provider = (
+        project.selected_applicant_user_id is not None
+        and current_user.id == project.selected_applicant_user_id
+    )
+
+    if not (is_owner or is_selected_provider):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not allowed to access this project",
+        )
+
+
+def ensure_project_visible(project: Project, current_user: User | None) -> None:
+    if project.status == "open":
+        return
+
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authentication required to access this project",
+        )
+
+    ensure_project_participant(project, current_user)
+
+
+def clean_required_text(value: str, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} cannot be empty",
+        )
+    return cleaned
+
+
+def clean_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def validate_project_type(project_type: str) -> str:
+    clean_project_type = project_type.strip().lower()
     if clean_project_type not in ALLOWED_PROJECT_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid project type. Allowed: {sorted(ALLOWED_PROJECT_TYPES)}",
         )
+    return clean_project_type
 
+
+def validate_currency(currency: str | None) -> str:
+    clean_currency = currency.strip().upper() if currency else "EUR"
     if clean_currency not in ALLOWED_CURRENCIES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid currency. Allowed: {sorted(ALLOWED_CURRENCIES)}",
         )
+    return clean_currency
 
-    if payload.budget_min > payload.budget_max:
+
+def validate_budget_range(budget_min: int | None, budget_max: int | None) -> None:
+    if budget_min is not None and budget_max is not None and budget_min > budget_max:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="budget_min cannot be greater than budget_max",
         )
+
+
+def validate_project_status_transition(project: Project, new_status: str) -> None:
+    if new_status not in ALLOWED_PROJECT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status. Allowed: {sorted(ALLOWED_PROJECT_STATUSES)}",
+        )
+
+    if new_status == project.status:
+        return
+
+    allowed_next_statuses = VALID_PROJECT_STATUS_TRANSITIONS.get(project.status, set())
+    if new_status not in allowed_next_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot change project status from '{project.status}' to '{new_status}'",
+        )
+
+    if new_status == "in_progress" and project.selected_application_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot move project to in_progress without an accepted application",
+        )
+
+
+@router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+def create_project(
+    payload: ProjectCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_customer),
+):
+    clean_title = clean_required_text(payload.title, "title")
+    clean_description = clean_required_text(payload.description, "description")
+    clean_country = clean_required_text(payload.country, "country")
+    clean_city = clean_optional_text(payload.city)
+    clean_project_type = validate_project_type(payload.project_type)
+    clean_currency = validate_currency(payload.currency)
+
+    validate_budget_range(payload.budget_min, payload.budget_max)
 
     project = Project(
         title=clean_title,
@@ -137,7 +235,7 @@ def search_projects(
     city: str | None = Query(None),
     project_type: str | None = Query(None),
     currency: str | None = Query(None),
-    status: str | None = Query("open"),
+    project_status: str | None = Query("open", alias="status"),
     budget_min: int | None = Query(None, ge=0),
     budget_max: int | None = Query(None, ge=0),
     deadline_days_max: int | None = Query(None, ge=1),
@@ -147,6 +245,8 @@ def search_projects(
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
+    validate_budget_range(budget_min, budget_max)
+
     query = db.query(Project)
 
     if q:
@@ -164,31 +264,23 @@ def search_projects(
             )
 
     if country:
-        query = query.filter(Project.country.ilike(country.strip()))
+        country_clean = country.strip()
+        if country_clean:
+            query = query.filter(Project.country.ilike(country_clean))
 
     if city:
-        query = query.filter(Project.city.ilike(city.strip()))
+        city_clean = city.strip()
+        if city_clean:
+            query = query.filter(Project.city.ilike(city_clean))
 
     if project_type:
-        clean_project_type = project_type.strip().lower()
-        if clean_project_type not in ALLOWED_PROJECT_TYPES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid project type. Allowed: {sorted(ALLOWED_PROJECT_TYPES)}",
-            )
-        query = query.filter(Project.project_type == clean_project_type)
+        query = query.filter(Project.project_type == validate_project_type(project_type))
 
     if currency:
-        clean_currency = currency.strip().upper()
-        if clean_currency not in ALLOWED_CURRENCIES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid currency. Allowed: {sorted(ALLOWED_CURRENCIES)}",
-            )
-        query = query.filter(Project.currency == clean_currency)
+        query = query.filter(Project.currency == validate_currency(currency))
 
-    if status:
-        clean_status = status.strip().lower()
+    if project_status:
+        clean_status = project_status.strip().lower()
         if clean_status not in ALLOWED_PROJECT_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -224,7 +316,6 @@ def search_projects(
         query = query.order_by(sort_column.desc(), Project.id.desc())
 
     total = query.count()
-
     offset = (page - 1) * page_size
     items = query.offset(offset).limit(page_size).all()
 
@@ -239,7 +330,7 @@ def search_projects(
             "city": city,
             "project_type": project_type,
             "currency": currency,
-            "status": status,
+            "status": project_status,
             "budget_min": budget_min,
             "budget_max": budget_max,
             "deadline_days_max": deadline_days_max,
@@ -253,7 +344,7 @@ def search_projects(
 @router.get("/my", response_model=list[ProjectResponse])
 def get_my_projects(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_customer),
 ):
     return (
         db.query(Project)
@@ -267,15 +358,10 @@ def get_my_projects(
 def get_project(
     project_id: int,
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
 ):
-    project = db.query(Project).filter(Project.id == project_id).first()
-
-    if not project:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
+    project = get_project_or_404(db, project_id)
+    ensure_project_visible(project, current_user)
     return project
 
 
@@ -284,58 +370,33 @@ def update_project(
     project_id: int,
     payload: ProjectUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_customer),
 ):
-    project = db.query(Project).filter(Project.id == project_id).first()
+    project = get_project_or_404(db, project_id)
+    ensure_project_owner(project, current_user)
 
-    if not project:
+    if project.status in {"completed", "cancelled"}:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found",
-        )
-
-    if project.owner_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not allowed to edit this project",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Completed or cancelled projects cannot be edited",
         )
 
     clean_project_type = None
     if payload.project_type is not None:
-        clean_project_type = payload.project_type.strip().lower()
-        if clean_project_type not in ALLOWED_PROJECT_TYPES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid project type. Allowed: {sorted(ALLOWED_PROJECT_TYPES)}",
-            )
+        clean_project_type = validate_project_type(payload.project_type)
+
+    clean_currency = None
+    if payload.currency is not None:
+        clean_currency = validate_currency(payload.currency)
 
     clean_status = None
     if payload.status is not None:
         clean_status = payload.status.strip().lower()
-        if clean_status not in ALLOWED_PROJECT_STATUSES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status. Allowed: {sorted(ALLOWED_PROJECT_STATUSES)}",
-            )
-
-    clean_currency = None
-    if payload.currency is not None:
-        clean_currency = payload.currency.strip().upper()
-        if clean_currency not in ALLOWED_CURRENCIES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid currency. Allowed: {sorted(ALLOWED_CURRENCIES)}",
-            )
+        validate_project_status_transition(project, clean_status)
 
     new_budget_min = payload.budget_min if payload.budget_min is not None else project.budget_min
     new_budget_max = payload.budget_max if payload.budget_max is not None else project.budget_max
-
-    if new_budget_min is not None and new_budget_max is not None:
-        if new_budget_min > new_budget_max:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="budget_min cannot be greater than budget_max",
-            )
+    validate_budget_range(new_budget_min, new_budget_max)
 
     original_title = project.title
     original_description = project.description
@@ -348,28 +409,28 @@ def update_project(
     original_deadline_days = project.deadline_days
     original_status = project.status
 
-    changed_fields = []
+    changed_fields: list[str] = []
 
     if payload.title is not None:
-        clean_title = payload.title.strip()
+        clean_title = clean_required_text(payload.title, "title")
         if clean_title != project.title:
             project.title = clean_title
             changed_fields.append("title")
 
     if payload.description is not None:
-        clean_description = payload.description.strip()
+        clean_description = clean_required_text(payload.description, "description")
         if clean_description != project.description:
             project.description = clean_description
             changed_fields.append("description")
 
     if payload.country is not None:
-        clean_country = payload.country.strip()
+        clean_country = clean_required_text(payload.country, "country")
         if clean_country != project.country:
             project.country = clean_country
             changed_fields.append("country")
 
     if payload.city is not None:
-        clean_city = payload.city.strip()
+        clean_city = clean_optional_text(payload.city)
         if clean_city != project.city:
             project.city = clean_city
             changed_fields.append("city")

@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from backend.core.dependencies import get_current_user
+from backend.core.dependencies import get_current_provider
 from backend.database.session import get_db
 from backend.models.application import Application
 from backend.models.project import Project
@@ -14,14 +14,8 @@ router = APIRouter(prefix="/dashboard/provider", tags=["Provider Dashboard"])
 @router.get("/summary")
 def get_provider_dashboard_summary(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_provider),
 ):
-    if current_user.role != "Provider":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only providers can access provider dashboard",
-        )
-
     saved_projects_count = (
         db.query(SavedProject)
         .filter(SavedProject.provider_id == current_user.id)
@@ -40,12 +34,19 @@ def get_provider_dashboard_summary(
     applications_rejected = applications_base.filter(Application.status == "rejected").count()
 
     active_jobs_count = (
-        db.query(Application)
-        .join(Project, Project.id == Application.project_id)
+        db.query(Project)
         .filter(
-            Application.applicant_user_id == current_user.id,
-            Application.status == "accepted",
+            Project.selected_applicant_user_id == current_user.id,
             Project.status == "in_progress",
+        )
+        .count()
+    )
+
+    completed_jobs_count = (
+        db.query(Project)
+        .filter(
+            Project.selected_applicant_user_id == current_user.id,
+            Project.status == "completed",
         )
         .count()
     )
@@ -69,9 +70,12 @@ def get_provider_dashboard_summary(
                     "id": project.id,
                     "title": project.title,
                     "country": project.country,
+                    "city": project.city,
                     "project_type": project.project_type,
                     "budget_min": project.budget_min,
                     "budget_max": project.budget_max,
+                    "currency": project.currency,
+                    "deadline_days": project.deadline_days,
                     "status": project.status,
                 },
             }
@@ -92,13 +96,17 @@ def get_provider_dashboard_summary(
             {
                 "application_id": application.id,
                 "application_status": application.status,
+                "created_at": application.created_at,
                 "project": {
                     "id": project.id,
                     "title": project.title,
                     "country": project.country,
+                    "city": project.city,
                     "project_type": project.project_type,
                     "budget_min": project.budget_min,
                     "budget_max": project.budget_max,
+                    "currency": project.currency,
+                    "deadline_days": project.deadline_days,
                     "status": project.status,
                 },
             }
@@ -114,6 +122,7 @@ def get_provider_dashboard_summary(
             "applications_accepted": applications_accepted,
             "applications_rejected": applications_rejected,
             "active_jobs_count": active_jobs_count,
+            "completed_jobs_count": completed_jobs_count,
         },
         "recent_saved_projects": recent_saved_projects,
         "recent_applications": recent_applications,

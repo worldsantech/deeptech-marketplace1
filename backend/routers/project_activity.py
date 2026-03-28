@@ -29,8 +29,14 @@ def get_project_or_404(project_id: int, db: Session) -> Project:
     return project
 
 
-def ensure_project_access(project: Project, current_user: User):
-    allowed_user_ids = [project.owner_id, project.selected_applicant_user_id]
+def ensure_project_access(project: Project, current_user: User) -> None:
+    if not project.selected_applicant_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Project does not have selected provider",
+        )
+
+    allowed_user_ids = {project.owner_id, project.selected_applicant_user_id}
     if current_user.id not in allowed_user_ids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

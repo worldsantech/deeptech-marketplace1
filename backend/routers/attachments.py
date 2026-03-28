@@ -34,7 +34,7 @@ if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
 
-def validate_file(file: UploadFile):
+def validate_file(file: UploadFile) -> None:
     if file.content_type not in ALLOWED_FILE_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -42,10 +42,20 @@ def validate_file(file: UploadFile):
         )
 
 
+def sanitize_original_filename(filename: str | None) -> str:
+    original = (filename or "").strip()
+    if not original:
+        return "file"
+
+    base = os.path.basename(original)
+    return base or "file"
+
+
 def save_file(file: UploadFile) -> tuple[str, str]:
-    file_ext = file.filename.split(".")[-1].lower() if "." in file.filename else "bin"
-    safe_name = f"{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, safe_name)
+    safe_original_name = sanitize_original_filename(file.filename)
+    file_ext = safe_original_name.split(".")[-1].lower() if "." in safe_original_name else "bin"
+    safe_storage_name = f"{uuid.uuid4()}.{file_ext}"
+    file_path = os.path.join(UPLOAD_DIR, safe_storage_name)
 
     content = file.file.read()
 
@@ -58,41 +68,113 @@ def save_file(file: UploadFile) -> tuple[str, str]:
     with open(file_path, "wb") as f:
         f.write(content)
 
-    return safe_name, file_path
+    return safe_original_name, file_path
 
 
 def get_attachment_or_404(attachment_id: int, db: Session) -> Attachment:
     attachment = db.query(Attachment).filter(Attachment.id == attachment_id).first()
     if not attachment:
-        raise HTTPException(status_code=404, detail="Attachment not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment not found",
+        )
     return attachment
 
 
 def get_project_or_404(project_id: int, db: Session) -> Project:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
     return project
 
 
-def check_project_access(project: Project, current_user: User):
-    if current_user.id not in [project.owner_id, project.selected_applicant_user_id]:
-        raise HTTPException(status_code=403, detail="No access to this project")
+def get_project_milestone_or_404(project_id: int, milestone_id: int, db: Session) -> Milestone:
+    milestone = (
+        db.query(Milestone)
+        .filter(
+            Milestone.id == milestone_id,
+            Milestone.project_id == project_id,
+        )
+        .first()
+    )
+    if not milestone:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Milestone not found for this project",
+        )
+    return milestone
 
 
-def check_attachment_access(
+def ensure_project_has_selected_provider(project: Project) -> None:
+    if not project.selected_applicant_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Project does not have selected provider",
+        )
+
+
+def ensure_project_participant(project: Project, current_user: User) -> None:
+    ensure_project_has_selected_provider(project)
+
+    allowed_user_ids = {project.owner_id, project.selected_applicant_user_id}
+    if current_user.id not in allowed_user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No access to this project",
+        )
+
+
+def ensure_milestone_matches_project(milestone: Milestone, project: Project) -> None:
+    if milestone.project_id != project.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Milestone does not belong to this project",
+        )
+
+    if milestone.customer_id != project.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Milestone customer does not match project owner",
+        )
+
+    if project.selected_applicant_user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Project does not have selected provider",
+        )
+
+    if milestone.provider_id != project.selected_applicant_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Milestone provider does not match selected provider",
+        )
+
+
+def ensure_attachment_access(
     attachment: Attachment,
     current_user: User,
     db: Session,
-):
+) -> Project:
     if not attachment.project_id:
-        raise HTTPException(status_code=400, detail="Attachment not linked to project")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Attachment not linked to project",
+        )
 
     project = get_project_or_404(attachment.project_id, db)
-    check_project_access(project, current_user)
+    ensure_project_participant(project, current_user)
+
+    if attachment.milestone_id is not None:
+        milestone = get_project_milestone_or_404(project.id, attachment.milestone_id, db)
+        ensure_milestone_matches_project(milestone, project)
+
+    return project
 
 
-@router.post("/upload", response_model=AttachmentResponse)
+@router.post("/upload", response_model=AttachmentResponse, status_code=status.HTTP_201_CREATED)
 def upload_attachment(
     project_id: int,
     milestone_id: int | None = None,
@@ -101,29 +183,24 @@ def upload_attachment(
     current_user: User = Depends(get_current_user),
 ):
     project = get_project_or_404(project_id, db)
-    check_project_access(project, current_user)
+    ensure_project_participant(project, current_user)
+
+    if project.status not in {"in_progress", "completed"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Attachments can be uploaded only for in_progress or completed projects",
+        )
 
     milestone = None
     if milestone_id is not None:
-        milestone = (
-            db.query(Milestone)
-            .filter(
-                Milestone.id == milestone_id,
-                Milestone.project_id == project_id,
-            )
-            .first()
-        )
-        if not milestone:
-            raise HTTPException(
-                status_code=404,
-                detail="Milestone not found for this project",
-            )
+        milestone = get_project_milestone_or_404(project_id, milestone_id, db)
+        ensure_milestone_matches_project(milestone, project)
 
     validate_file(file)
-    _, file_path = save_file(file)
+    original_filename, file_path = save_file(file)
 
     attachment = Attachment(
-        file_name=file.filename,
+        file_name=original_filename,
         file_path=file_path,
         file_type=file.content_type,
         uploaded_by=current_user.id,
@@ -139,7 +216,7 @@ def upload_attachment(
         project_id=project.id,
         event_type="attachment_uploaded",
         title="File uploaded",
-        description=file.filename,
+        description=original_filename,
         actor_user_id=current_user.id,
         entity_type="attachment",
         entity_id=attachment.id,
@@ -162,10 +239,13 @@ def download_attachment(
     current_user: User = Depends(get_current_user),
 ):
     attachment = get_attachment_or_404(attachment_id, db)
-    check_attachment_access(attachment, current_user, db)
+    ensure_attachment_access(attachment, current_user, db)
 
     if not os.path.exists(attachment.file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found on disk",
+        )
 
     return FileResponse(
         path=attachment.file_path,

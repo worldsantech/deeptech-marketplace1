@@ -22,7 +22,6 @@ def get_homepage_feed(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # ================= FEATURED PROVIDERS =================
     provider_rows = (
         db.query(
             User,
@@ -34,7 +33,7 @@ def get_homepage_feed(
         .outerjoin(Review, Review.reviewed_user_id == User.id)
         .filter(User.role == "Provider")
         .group_by(User.id, ProviderProfile.id)
-        .order_by(func.avg(Review.rating).desc().nullslast())
+        .order_by(func.avg(Review.rating).desc().nullslast(), User.id.desc())
         .limit(featured_providers_limit)
         .all()
     )
@@ -46,19 +45,20 @@ def get_homepage_feed(
                 "user": {
                     "id": user.id,
                     "full_name": user.full_name,
+                    "role": user.role,
                 },
                 "profile": {
                     "skills": profile.skills,
                     "country": profile.country,
+                    "availability": profile.availability,
                 },
                 "stats": {
                     "average_rating": round(float(avg_rating), 2) if avg_rating else None,
-                    "reviews_count": reviews_count,
+                    "reviews_count": int(reviews_count or 0),
                 },
             }
         )
 
-    # ================= FEATURED PROJECTS =================
     featured_projects = (
         db.query(Project)
         .filter(Project.status == "open")
@@ -74,11 +74,15 @@ def get_homepage_feed(
                 "id": project.id,
                 "title": project.title,
                 "country": project.country,
+                "city": project.city,
                 "project_type": project.project_type,
+                "budget_min": project.budget_min,
+                "budget_max": project.budget_max,
+                "currency": project.currency,
+                "deadline_days": project.deadline_days,
             }
         )
 
-    # ================= LATEST PROJECTS =================
     latest_projects = (
         db.query(Project)
         .filter(Project.status == "open")
@@ -94,18 +98,25 @@ def get_homepage_feed(
                 "id": project.id,
                 "title": project.title,
                 "country": project.country,
+                "city": project.city,
                 "project_type": project.project_type,
+                "budget_min": project.budget_min,
+                "budget_max": project.budget_max,
+                "currency": project.currency,
+                "deadline_days": project.deadline_days,
             }
         )
 
-    # ================= PERSONALIZATION =================
     personalization = {}
 
-    # ---------- PROVIDER ----------
     if current_user.role == "Provider":
         saved_ids = (
             db.query(SavedProject.project_id)
-            .filter(SavedProject.provider_id == current_user.id)
+            .join(Project, Project.id == SavedProject.project_id)
+            .filter(
+                SavedProject.provider_id == current_user.id,
+                Project.status == "open",
+            )
             .all()
         )
 
@@ -129,6 +140,11 @@ def get_homepage_feed(
                     "id": p.id,
                     "title": p.title,
                     "country": p.country,
+                    "city": p.city,
+                    "project_type": p.project_type,
+                    "budget_min": p.budget_min,
+                    "budget_max": p.budget_max,
+                    "currency": p.currency,
                 }
                 for p in recommended_projects
             ],
@@ -136,7 +152,6 @@ def get_homepage_feed(
             "applied_project_ids": [p[0] for p in applied_ids],
         }
 
-    # ---------- CUSTOMER ----------
     if current_user.role == "Customer":
         my_projects = (
             db.query(Project)
@@ -168,6 +183,8 @@ def get_homepage_feed(
                     "id": u.id,
                     "full_name": u.full_name,
                     "skills": prof.skills,
+                    "country": prof.country,
+                    "availability": prof.availability,
                 }
                 for u, prof in recommended_providers
             ],

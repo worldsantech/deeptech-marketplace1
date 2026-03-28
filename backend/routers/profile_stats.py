@@ -14,18 +14,43 @@ from backend.models.user import User
 router = APIRouter(prefix="/profiles", tags=["Profile Stats"])
 
 
-@router.get("/{user_id}/stats")
-def get_profile_stats(
-    user_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def get_user_or_404(user_id: int, db: Session) -> User:
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
+    return user
+
+
+def build_recent_reviews(review_rows):
+    recent_reviews = []
+    for review, reviewer in review_rows:
+        recent_reviews.append(
+            {
+                "review_id": review.id,
+                "project_id": review.project_id,
+                "rating": review.rating,
+                "comment": review.comment,
+                "created_at": review.created_at,
+                "reviewer": {
+                    "id": reviewer.id,
+                    "full_name": reviewer.full_name,
+                    "role": reviewer.role,
+                },
+            }
+        )
+    return recent_reviews
+
+
+@router.get("/{user_id}/stats")
+def get_profile_stats(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = get_user_or_404(user_id, db)
 
     average_rating = (
         db.query(func.avg(Review.rating))
@@ -48,70 +73,13 @@ def get_profile_stats(
         .all()
     )
 
-    recent_reviews = []
-    for review, reviewer in recent_reviews_rows:
-        recent_reviews.append(
-            {
-                "review_id": review.id,
-                "project_id": review.project_id,
-                "rating": review.rating,
-                "comment": review.comment,
-                "created_at": review.created_at,
-                "reviewer": {
-                    "id": reviewer.id,
-                    "full_name": reviewer.full_name,
-                    "role": reviewer.role,
-                },
-            }
-        )
+    recent_reviews = build_recent_reviews(recent_reviews_rows)
 
     if user.role == "Provider":
         profile = (
             db.query(ProviderProfile)
             .filter(ProviderProfile.user_id == user.id)
             .first()
-        )
-
-        applications_total = (
-            db.query(Application)
-            .filter(Application.applicant_user_id == user.id)
-            .count()
-        )
-
-        applications_submitted = (
-            db.query(Application)
-            .filter(
-                Application.applicant_user_id == user.id,
-                Application.status == "submitted",
-            )
-            .count()
-        )
-
-        applications_shortlisted = (
-            db.query(Application)
-            .filter(
-                Application.applicant_user_id == user.id,
-                Application.status == "shortlisted",
-            )
-            .count()
-        )
-
-        applications_accepted = (
-            db.query(Application)
-            .filter(
-                Application.applicant_user_id == user.id,
-                Application.status == "accepted",
-            )
-            .count()
-        )
-
-        applications_rejected = (
-            db.query(Application)
-            .filter(
-                Application.applicant_user_id == user.id,
-                Application.status == "rejected",
-            )
-            .count()
         )
 
         completed_projects_count = (
@@ -132,11 +100,63 @@ def get_profile_stats(
             .count()
         )
 
+        is_owner = current_user.id == user.id
+
+        applications_total = None
+        applications_submitted = None
+        applications_shortlisted = None
+        applications_accepted = None
+        applications_rejected = None
+
+        if is_owner:
+            applications_total = (
+                db.query(Application)
+                .filter(Application.applicant_user_id == user.id)
+                .count()
+            )
+
+            applications_submitted = (
+                db.query(Application)
+                .filter(
+                    Application.applicant_user_id == user.id,
+                    Application.status == "submitted",
+                )
+                .count()
+            )
+
+            applications_shortlisted = (
+                db.query(Application)
+                .filter(
+                    Application.applicant_user_id == user.id,
+                    Application.status == "shortlisted",
+                )
+                .count()
+            )
+
+            applications_accepted = (
+                db.query(Application)
+                .filter(
+                    Application.applicant_user_id == user.id,
+                    Application.status == "accepted",
+                )
+                .count()
+            )
+
+            applications_rejected = (
+                db.query(Application)
+                .filter(
+                    Application.applicant_user_id == user.id,
+                    Application.status == "rejected",
+                )
+                .count()
+            )
+
         return {
             "user": {
                 "id": user.id,
                 "full_name": user.full_name,
                 "role": user.role,
+                "is_owner_view": is_owner,
             },
             "profile": {
                 "bio": profile.bio if profile else None,
@@ -198,18 +218,23 @@ def get_profile_stats(
             .count()
         )
 
-        applications_received_total = (
-            db.query(Application)
-            .join(Project, Project.id == Application.project_id)
-            .filter(Project.owner_id == user.id)
-            .count()
-        )
+        is_owner = current_user.id == user.id
+        applications_received_total = None
+
+        if is_owner:
+            applications_received_total = (
+                db.query(Application)
+                .join(Project, Project.id == Application.project_id)
+                .filter(Project.owner_id == user.id)
+                .count()
+            )
 
         return {
             "user": {
                 "id": user.id,
                 "full_name": user.full_name,
                 "role": user.role,
+                "is_owner_view": is_owner,
             },
             "profile": {
                 "bio": profile.bio if profile else None,
@@ -232,6 +257,7 @@ def get_profile_stats(
             "id": user.id,
             "full_name": user.full_name,
             "role": user.role,
+            "is_owner_view": current_user.id == user.id,
         },
         "stats": {
             "average_rating": round(float(average_rating), 2) if average_rating is not None else None,
@@ -246,12 +272,7 @@ def get_public_profile_with_stats(
     user_id: int,
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
+    user = get_user_or_404(user_id, db)
 
     average_rating = (
         db.query(func.avg(Review.rating))

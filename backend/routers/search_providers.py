@@ -1,9 +1,10 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from backend.core.roles import ROLE_PROVIDER
 from backend.database.session import get_db
 from backend.models.provider_profile import ProviderProfile
 from backend.models.review import Review
@@ -32,20 +33,23 @@ def search_providers(
 ):
     if sort_by not in ALLOWED_PROVIDER_SORTS:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid sort_by. Allowed values: {', '.join(sorted(ALLOWED_PROVIDER_SORTS))}",
         )
+
+    average_rating_expr = func.avg(Review.rating)
+    reviews_count_expr = func.count(Review.id)
 
     query = (
         db.query(
             User,
             ProviderProfile,
-            func.avg(Review.rating).label("average_rating"),
-            func.count(Review.id).label("reviews_count"),
+            average_rating_expr.label("average_rating"),
+            reviews_count_expr.label("reviews_count"),
         )
         .join(ProviderProfile, ProviderProfile.user_id == User.id)
         .outerjoin(Review, Review.reviewed_user_id == User.id)
-        .filter(User.role == "Provider")
+        .filter(User.role == ROLE_PROVIDER)
         .group_by(User.id, ProviderProfile.id)
     )
 
@@ -64,28 +68,34 @@ def search_providers(
             )
 
     if country:
-        query = query.filter(ProviderProfile.country.ilike(country.strip()))
+        country_clean = country.strip()
+        if country_clean:
+            query = query.filter(ProviderProfile.country.ilike(country_clean))
 
     if availability:
-        query = query.filter(ProviderProfile.availability.ilike(availability.strip()))
+        availability_clean = availability.strip()
+        if availability_clean:
+            query = query.filter(ProviderProfile.availability.ilike(availability_clean))
 
     if skills:
-        query = query.filter(ProviderProfile.skills.ilike(f"%{skills.strip()}%"))
+        skills_clean = skills.strip()
+        if skills_clean:
+            query = query.filter(ProviderProfile.skills.ilike(f"%{skills_clean}%"))
 
     total = query.count()
 
     if sort_by == "newest":
-        query = query.order_by(User.id.desc())
+        query = query.order_by(User.created_at.desc(), User.id.desc())
     elif sort_by == "rating":
         query = query.order_by(
-            func.avg(Review.rating).desc().nullslast(),
-            func.count(Review.id).desc(),
+            average_rating_expr.desc().nullslast(),
+            reviews_count_expr.desc(),
             User.id.desc(),
         )
     elif sort_by == "reviews_count":
         query = query.order_by(
-            func.count(Review.id).desc(),
-            func.avg(Review.rating).desc().nullslast(),
+            reviews_count_expr.desc(),
+            average_rating_expr.desc().nullslast(),
             User.id.desc(),
         )
     elif sort_by == "full_name":
@@ -115,8 +125,8 @@ def search_providers(
             }
         )
 
-    page = (offset // limit) + 1 if limit else 1
-    pages = (total + limit - 1) // limit if limit else 1
+    page = (offset // limit) + 1
+    pages = (total + limit - 1) // limit
 
     return {
         "total": total,

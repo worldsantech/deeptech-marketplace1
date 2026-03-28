@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -39,6 +39,14 @@ ALLOWED_PROJECT_SORTS = {
 }
 
 
+def validate_budget_range(budget_min: int | None, budget_max: int | None) -> None:
+    if budget_min is not None and budget_max is not None and budget_min > budget_max:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="budget_min cannot be greater than budget_max",
+        )
+
+
 @router.get("/")
 def search_projects(
     q: Optional[str] = Query(None),
@@ -57,18 +65,20 @@ def search_projects(
 ):
     if sort_by not in ALLOWED_PROJECT_SORTS:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid sort_by. Allowed values: {', '.join(sorted(ALLOWED_PROJECT_SORTS))}",
         )
 
     clean_status = status.strip().lower()
     if clean_status not in ALLOWED_PROJECT_STATUSES:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid status. Allowed values: {', '.join(sorted(ALLOWED_PROJECT_STATUSES))}",
         )
 
-    query = db.query(Project)
+    validate_budget_range(budget_min, budget_max)
+
+    query = db.query(Project).filter(Project.status == clean_status)
 
     if q:
         q_clean = q.strip()
@@ -85,19 +95,21 @@ def search_projects(
                 )
             )
 
-    query = query.filter(Project.status == clean_status)
-
     if country:
-        query = query.filter(Project.country.ilike(country.strip()))
+        country_clean = country.strip()
+        if country_clean:
+            query = query.filter(Project.country.ilike(country_clean))
 
     if city:
-        query = query.filter(Project.city.ilike(city.strip()))
+        city_clean = city.strip()
+        if city_clean:
+            query = query.filter(Project.city.ilike(city_clean))
 
     if project_type:
         clean_project_type = project_type.strip().lower()
         if clean_project_type not in ALLOWED_PROJECT_TYPES:
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid project_type. Allowed values: {', '.join(sorted(ALLOWED_PROJECT_TYPES))}",
             )
         query = query.filter(Project.project_type == clean_project_type)
@@ -106,7 +118,7 @@ def search_projects(
         clean_currency = currency.strip().upper()
         if clean_currency not in ALLOWED_CURRENCIES:
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid currency. Allowed values: {', '.join(sorted(ALLOWED_CURRENCIES))}",
             )
         query = query.filter(Project.currency == clean_currency)
@@ -123,7 +135,7 @@ def search_projects(
     total = query.count()
 
     if sort_by == "newest":
-        query = query.order_by(Project.id.desc())
+        query = query.order_by(Project.created_at.desc(), Project.id.desc())
     elif sort_by == "budget_min":
         query = query.order_by(Project.budget_min.asc(), Project.id.desc())
     elif sort_by == "budget_max":
@@ -135,8 +147,8 @@ def search_projects(
 
     items = query.offset(offset).limit(limit).all()
 
-    page = (offset // limit) + 1 if limit else 1
-    pages = (total + limit - 1) // limit if limit else 1
+    page = (offset // limit) + 1
+    pages = (total + limit - 1) // limit
 
     return {
         "total": total,

@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import List
 
@@ -20,10 +21,15 @@ from backend.schemas.milestone import (
 )
 from backend.services.project_event_logger import log_project_event
 
+logger = logging.getLogger("app")
+
 router = APIRouter(
     prefix="/projects",
     tags=["Milestones"],
 )
+
+EDITABLE_MILESTONE_STATUSES = {"pending", "changes_requested"}
+SUBMITTABLE_MILESTONE_STATUSES = {"pending", "changes_requested"}
 
 
 def get_project_or_404(project_id: int, db: Session) -> Project:
@@ -53,7 +59,7 @@ def get_milestone_or_404(project_id: int, milestone_id: int, db: Session) -> Mil
     return milestone
 
 
-def ensure_project_has_selected_provider(project: Project):
+def ensure_project_has_selected_provider(project: Project) -> None:
     if not project.selected_applicant_user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -61,7 +67,7 @@ def ensure_project_has_selected_provider(project: Project):
         )
 
 
-def ensure_customer_access(project: Project, current_user: User):
+def ensure_customer_access(project: Project, current_user: User) -> None:
     if current_user.id != project.owner_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -69,7 +75,8 @@ def ensure_customer_access(project: Project, current_user: User):
         )
 
 
-def ensure_provider_access(project: Project, current_user: User):
+def ensure_provider_access(project: Project, current_user: User) -> None:
+    ensure_project_has_selected_provider(project)
     if current_user.id != project.selected_applicant_user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -77,13 +84,61 @@ def ensure_provider_access(project: Project, current_user: User):
         )
 
 
-def ensure_project_participant(project: Project, current_user: User):
-    allowed_user_ids = [project.owner_id, project.selected_applicant_user_id]
+def ensure_project_participant(project: Project, current_user: User) -> None:
+    ensure_project_has_selected_provider(project)
+
+    allowed_user_ids = {project.owner_id, project.selected_applicant_user_id}
     if current_user.id not in allowed_user_ids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to project milestones",
         )
+
+
+def ensure_milestone_belongs_to_project_and_participants(
+    milestone: Milestone,
+    project: Project,
+) -> None:
+    if milestone.project_id != project.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Milestone does not belong to this project",
+        )
+
+    if milestone.customer_id != project.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Milestone customer does not match project owner",
+        )
+
+    if project.selected_applicant_user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Project does not have selected provider",
+        )
+
+    if milestone.provider_id != project.selected_applicant_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Milestone provider does not match selected provider",
+        )
+
+
+def clean_required_text(value: str, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} cannot be empty",
+        )
+    return cleaned
+
+
+def clean_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
 
 
 def get_milestone_attachments(milestone_id: int, db: Session) -> List[Attachment]:
@@ -129,50 +184,69 @@ def create_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = get_project_or_404(project_id, db)
-    ensure_customer_access(project, current_user)
-    ensure_project_has_selected_provider(project)
+    try:
+        project = get_project_or_404(project_id, db)
+        ensure_customer_access(project, current_user)
+        ensure_project_has_selected_provider(project)
 
-    if project.status not in ["in_progress", "open"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Milestones can be created only for open or in_progress projects",
+        if project.status != "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Milestones can be created only for in_progress projects",
+            )
+
+        title = clean_required_text(payload.title, "title")
+        description = clean_optional_text(payload.description)
+
+        milestone = Milestone(
+            project_id=project.id,
+            customer_id=project.owner_id,
+            provider_id=project.selected_applicant_user_id,
+            title=title,
+            description=description,
+            amount=payload.amount,
+            due_date=payload.due_date,
+            status="pending",
         )
 
-    milestone = Milestone(
-        project_id=project.id,
-        customer_id=project.owner_id,
-        provider_id=project.selected_applicant_user_id,
-        title=payload.title.strip(),
-        description=payload.description,
-        amount=payload.amount,
-        due_date=payload.due_date,
-        status="pending",
-    )
+        db.add(milestone)
+        db.flush()
 
-    db.add(milestone)
-    db.flush()
+        log_project_event(
+            db=db,
+            project_id=project.id,
+            event_type="milestone_created",
+            title="Milestone created",
+            description=milestone.title,
+            actor_user_id=current_user.id,
+            entity_type="milestone",
+            entity_id=milestone.id,
+            metadata={
+                "status": milestone.status,
+                "amount": float(milestone.amount) if milestone.amount is not None else None,
+                "due_date": milestone.due_date.isoformat() if milestone.due_date else None,
+            },
+        )
 
-    log_project_event(
-        db=db,
-        project_id=project.id,
-        event_type="milestone_created",
-        title="Milestone created",
-        description=milestone.title,
-        actor_user_id=current_user.id,
-        entity_type="milestone",
-        entity_id=milestone.id,
-        metadata={
-            "status": milestone.status,
-            "amount": float(milestone.amount) if milestone.amount is not None else None,
-            "due_date": milestone.due_date.isoformat() if milestone.due_date else None,
-        },
-    )
+        db.commit()
+        db.refresh(milestone)
 
-    db.commit()
-    db.refresh(milestone)
+        return build_milestone_response(milestone, db)
 
-    return build_milestone_response(milestone, db)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unhandled error while creating milestone. project_id=%s user_id=%s",
+            project_id,
+            current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create milestone",
+        )
 
 
 @router.get(
@@ -185,7 +259,6 @@ def list_project_milestones(
     current_user: User = Depends(get_current_user),
 ):
     project = get_project_or_404(project_id, db)
-    ensure_project_has_selected_provider(project)
     ensure_project_participant(project, current_user)
 
     milestones = (
@@ -209,10 +282,11 @@ def get_milestone(
     current_user: User = Depends(get_current_user),
 ):
     project = get_project_or_404(project_id, db)
-    ensure_project_has_selected_provider(project)
     ensure_project_participant(project, current_user)
 
     milestone = get_milestone_or_404(project_id, milestone_id, db)
+    ensure_milestone_belongs_to_project_and_participants(milestone, project)
+
     return build_milestone_response(milestone, db)
 
 
@@ -227,34 +301,58 @@ def update_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = get_project_or_404(project_id, db)
-    ensure_customer_access(project, current_user)
-    ensure_project_has_selected_provider(project)
+    try:
+        project = get_project_or_404(project_id, db)
+        ensure_customer_access(project, current_user)
+        ensure_project_has_selected_provider(project)
 
-    milestone = get_milestone_or_404(project_id, milestone_id, db)
+        if project.status != "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Milestones can be updated only when project is in_progress",
+            )
 
-    if milestone.status == "approved":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Approved milestone cannot be edited",
+        milestone = get_milestone_or_404(project_id, milestone_id, db)
+        ensure_milestone_belongs_to_project_and_participants(milestone, project)
+
+        if milestone.status not in EDITABLE_MILESTONE_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only pending or changes_requested milestone can be edited",
+            )
+
+        if payload.title is not None:
+            milestone.title = clean_required_text(payload.title, "title")
+
+        if payload.description is not None:
+            milestone.description = clean_optional_text(payload.description)
+
+        if payload.amount is not None:
+            milestone.amount = payload.amount
+
+        if payload.due_date is not None:
+            milestone.due_date = payload.due_date
+
+        db.commit()
+        db.refresh(milestone)
+
+        return build_milestone_response(milestone, db)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unhandled error while updating milestone. project_id=%s milestone_id=%s user_id=%s",
+            project_id,
+            milestone_id,
+            current_user.id,
         )
-
-    if payload.title is not None:
-        milestone.title = payload.title.strip()
-
-    if payload.description is not None:
-        milestone.description = payload.description
-
-    if payload.amount is not None:
-        milestone.amount = payload.amount
-
-    if payload.due_date is not None:
-        milestone.due_date = payload.due_date
-
-    db.commit()
-    db.refresh(milestone)
-
-    return build_milestone_response(milestone, db)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update milestone",
+        )
 
 
 @router.post(
@@ -268,90 +366,109 @@ def submit_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = get_project_or_404(project_id, db)
-    ensure_project_has_selected_provider(project)
-    ensure_provider_access(project, current_user)
+    try:
+        project = get_project_or_404(project_id, db)
+        ensure_provider_access(project, current_user)
 
-    if project.status != "in_progress":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Milestones can be submitted only when project is in_progress",
-        )
-
-    milestone = get_milestone_or_404(project_id, milestone_id, db)
-
-    if milestone.status not in ["pending", "changes_requested"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only pending or changes_requested milestones can be submitted",
-        )
-
-    attachments = []
-    if payload.attachment_ids:
-        attachments = (
-            db.query(Attachment)
-            .filter(Attachment.id.in_(payload.attachment_ids))
-            .all()
-        )
-
-        if len(attachments) != len(set(payload.attachment_ids)):
+        if project.status != "in_progress":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="One or more attachments not found",
+                detail="Milestones can be submitted only when project is in_progress",
             )
 
+        milestone = get_milestone_or_404(project_id, milestone_id, db)
+        ensure_milestone_belongs_to_project_and_participants(milestone, project)
+
+        if milestone.status not in SUBMITTABLE_MILESTONE_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only pending or changes_requested milestones can be submitted",
+            )
+
+        attachments = []
+        if payload.attachment_ids:
+            unique_attachment_ids = list(dict.fromkeys(payload.attachment_ids))
+            attachments = (
+                db.query(Attachment)
+                .filter(Attachment.id.in_(unique_attachment_ids))
+                .all()
+            )
+
+            if len(attachments) != len(unique_attachment_ids):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="One or more attachments not found",
+                )
+
+            for attachment in attachments:
+                if attachment.uploaded_by != current_user.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You can attach only your own uploaded files",
+                    )
+
+                if attachment.project_id != project.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Attachment does not belong to this project",
+                    )
+
+                if attachment.message_id is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Message attachment cannot be reused for milestone",
+                    )
+
+                if attachment.milestone_id is not None and attachment.milestone_id != milestone.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Attachment is already linked to another milestone",
+                    )
+
+        milestone.status = "submitted"
+        milestone.provider_note = clean_optional_text(payload.provider_note)
+        milestone.customer_note = None
+        milestone.submitted_at = datetime.utcnow()
+        milestone.approved_at = None
+
         for attachment in attachments:
-            if attachment.uploaded_by != current_user.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You can attach only your own uploaded files",
-                )
+            attachment.milestone_id = milestone.id
 
-            if attachment.project_id != project.id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Attachment does not belong to this project",
-                )
+        log_project_event(
+            db=db,
+            project_id=project.id,
+            event_type="milestone_submitted",
+            title="Milestone submitted",
+            description=milestone.title,
+            actor_user_id=current_user.id,
+            entity_type="milestone",
+            entity_id=milestone.id,
+            metadata={
+                "attachments_count": len(attachments),
+                "provider_note_present": bool(milestone.provider_note),
+            },
+        )
 
-            if attachment.message_id is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Message attachment cannot be reused for milestone",
-                )
+        db.commit()
+        db.refresh(milestone)
 
-            if attachment.milestone_id is not None and attachment.milestone_id != milestone.id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Attachment is already linked to another milestone",
-                )
+        return build_milestone_response(milestone, db)
 
-    milestone.status = "submitted"
-    milestone.provider_note = payload.provider_note
-    milestone.customer_note = None
-    milestone.submitted_at = datetime.utcnow()
-
-    for attachment in attachments:
-        attachment.milestone_id = milestone.id
-
-    log_project_event(
-        db=db,
-        project_id=project.id,
-        event_type="milestone_submitted",
-        title="Milestone submitted",
-        description=milestone.title,
-        actor_user_id=current_user.id,
-        entity_type="milestone",
-        entity_id=milestone.id,
-        metadata={
-            "attachments_count": len(attachments),
-            "provider_note_present": bool(payload.provider_note),
-        },
-    )
-
-    db.commit()
-    db.refresh(milestone)
-
-    return build_milestone_response(milestone, db)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unhandled error while submitting milestone. project_id=%s milestone_id=%s user_id=%s",
+            project_id,
+            milestone_id,
+            current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to submit milestone",
+        )
 
 
 @router.post(
@@ -365,41 +482,65 @@ def approve_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = get_project_or_404(project_id, db)
-    ensure_customer_access(project, current_user)
-    ensure_project_has_selected_provider(project)
+    try:
+        project = get_project_or_404(project_id, db)
+        ensure_customer_access(project, current_user)
+        ensure_project_has_selected_provider(project)
 
-    milestone = get_milestone_or_404(project_id, milestone_id, db)
+        if project.status != "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Milestones can be approved only when project is in_progress",
+            )
 
-    if milestone.status != "submitted":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only submitted milestones can be approved",
+        milestone = get_milestone_or_404(project_id, milestone_id, db)
+        ensure_milestone_belongs_to_project_and_participants(milestone, project)
+
+        if milestone.status != "submitted":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only submitted milestones can be approved",
+            )
+
+        milestone.status = "approved"
+        milestone.customer_note = clean_optional_text(payload.customer_note)
+        milestone.approved_at = datetime.utcnow()
+
+        log_project_event(
+            db=db,
+            project_id=project.id,
+            event_type="milestone_approved",
+            title="Milestone approved",
+            description=milestone.title,
+            actor_user_id=current_user.id,
+            entity_type="milestone",
+            entity_id=milestone.id,
+            metadata={
+                "amount": float(milestone.amount) if milestone.amount is not None else None,
+                "customer_note_present": bool(milestone.customer_note),
+            },
         )
 
-    milestone.status = "approved"
-    milestone.customer_note = payload.customer_note
-    milestone.approved_at = datetime.utcnow()
+        db.commit()
+        db.refresh(milestone)
 
-    log_project_event(
-        db=db,
-        project_id=project.id,
-        event_type="milestone_approved",
-        title="Milestone approved",
-        description=milestone.title,
-        actor_user_id=current_user.id,
-        entity_type="milestone",
-        entity_id=milestone.id,
-        metadata={
-            "amount": float(milestone.amount) if milestone.amount is not None else None,
-            "customer_note_present": bool(payload.customer_note),
-        },
-    )
+        return build_milestone_response(milestone, db)
 
-    db.commit()
-    db.refresh(milestone)
-
-    return build_milestone_response(milestone, db)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unhandled error while approving milestone. project_id=%s milestone_id=%s user_id=%s",
+            project_id,
+            milestone_id,
+            current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to approve milestone",
+        )
 
 
 @router.post(
@@ -413,40 +554,64 @@ def request_changes_for_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = get_project_or_404(project_id, db)
-    ensure_customer_access(project, current_user)
-    ensure_project_has_selected_provider(project)
+    try:
+        project = get_project_or_404(project_id, db)
+        ensure_customer_access(project, current_user)
+        ensure_project_has_selected_provider(project)
 
-    milestone = get_milestone_or_404(project_id, milestone_id, db)
+        if project.status != "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Changes can be requested only when project is in_progress",
+            )
 
-    if milestone.status != "submitted":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only submitted milestones can be sent back for changes",
+        milestone = get_milestone_or_404(project_id, milestone_id, db)
+        ensure_milestone_belongs_to_project_and_participants(milestone, project)
+
+        if milestone.status != "submitted":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only submitted milestones can be sent back for changes",
+            )
+
+        milestone.status = "changes_requested"
+        milestone.customer_note = clean_optional_text(payload.customer_note)
+        milestone.approved_at = None
+
+        log_project_event(
+            db=db,
+            project_id=project.id,
+            event_type="milestone_changes_requested",
+            title="Changes requested",
+            description=milestone.title,
+            actor_user_id=current_user.id,
+            entity_type="milestone",
+            entity_id=milestone.id,
+            metadata={
+                "customer_note_present": bool(milestone.customer_note),
+            },
         )
 
-    milestone.status = "changes_requested"
-    milestone.customer_note = payload.customer_note
-    milestone.approved_at = None
+        db.commit()
+        db.refresh(milestone)
 
-    log_project_event(
-        db=db,
-        project_id=project.id,
-        event_type="milestone_changes_requested",
-        title="Changes requested",
-        description=milestone.title,
-        actor_user_id=current_user.id,
-        entity_type="milestone",
-        entity_id=milestone.id,
-        metadata={
-            "customer_note_present": bool(payload.customer_note),
-        },
-    )
+        return build_milestone_response(milestone, db)
 
-    db.commit()
-    db.refresh(milestone)
-
-    return build_milestone_response(milestone, db)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unhandled error while requesting milestone changes. project_id=%s milestone_id=%s user_id=%s",
+            project_id,
+            milestone_id,
+            current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to request milestone changes",
+        )
 
 
 @router.delete(
@@ -459,40 +624,64 @@ def delete_milestone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    project = get_project_or_404(project_id, db)
-    ensure_customer_access(project, current_user)
-    ensure_project_has_selected_provider(project)
+    try:
+        project = get_project_or_404(project_id, db)
+        ensure_customer_access(project, current_user)
+        ensure_project_has_selected_provider(project)
 
-    milestone = get_milestone_or_404(project_id, milestone_id, db)
+        if project.status != "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Milestones can be deleted only when project is in_progress",
+            )
 
-    if milestone.status in ["submitted", "approved"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Submitted or approved milestone cannot be deleted",
+        milestone = get_milestone_or_404(project_id, milestone_id, db)
+        ensure_milestone_belongs_to_project_and_participants(milestone, project)
+
+        if milestone.status in {"submitted", "approved"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Submitted or approved milestone cannot be deleted",
+            )
+
+        attachments = (
+            db.query(Attachment)
+            .filter(Attachment.milestone_id == milestone.id)
+            .all()
         )
 
-    attachments = (
-        db.query(Attachment)
-        .filter(Attachment.milestone_id == milestone.id)
-        .all()
-    )
+        for attachment in attachments:
+            attachment.milestone_id = None
 
-    for attachment in attachments:
-        attachment.milestone_id = None
+        log_project_event(
+            db=db,
+            project_id=project.id,
+            event_type="milestone_deleted",
+            title="Milestone deleted",
+            description=milestone.title,
+            actor_user_id=current_user.id,
+            entity_type="milestone",
+            entity_id=milestone.id,
+            metadata={},
+        )
 
-    log_project_event(
-        db=db,
-        project_id=project.id,
-        event_type="milestone_deleted",
-        title="Milestone deleted",
-        description=milestone.title,
-        actor_user_id=current_user.id,
-        entity_type="milestone",
-        entity_id=milestone.id,
-        metadata={},
-    )
+        db.delete(milestone)
+        db.commit()
 
-    db.delete(milestone)
-    db.commit()
+        return None
 
-    return None
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unhandled error while deleting milestone. project_id=%s milestone_id=%s user_id=%s",
+            project_id,
+            milestone_id,
+            current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete milestone",
+        )
